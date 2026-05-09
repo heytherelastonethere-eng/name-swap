@@ -1,0 +1,745 @@
+-- ============================================================
+--   BOOGA BOOGA REBORN | ROLEPLAY NAME SWAPPER
+--   Delta Executor | iOS & Mobile
+--   Leaderboard protected from "!" lock + zero lag
+-- ============================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+local originalNames = {}
+local originalLeaderboard = {}
+local swapped = {}
+local otherNameRefs = {}
+local activeConnections = {}
+
+-- ============================================================
+-- COMBAT LABEL REGISTRY
+-- ============================================================
+local combatLabels = {}
+local leaderboardLabels = {}
+
+local function registerLeaderboardLabel(obj)
+    leaderboardLabels[obj] = true
+end
+
+local function isLeaderboardLabel(obj)
+    return leaderboardLabels[obj] == true
+end
+
+local function lockCombatLabel(obj)
+    if combatLabels[obj] then return end
+    if isLeaderboardLabel(obj) then return end
+    combatLabels[obj] = true
+    obj.Text = "!"
+    obj:GetPropertyChangedSignal("Text"):Connect(function()
+        if combatLabels[obj] and obj.Text ~= "!" then
+            obj.Text = "!"
+        end
+    end)
+end
+
+local function unlockCombatLabel(obj)
+    combatLabels[obj] = nil
+end
+
+-- ============================================================
+-- COMBAT MARKER DETECTION
+-- Only fires on labels inside a character, red colored
+-- Never fires on leaderboard labels
+-- ============================================================
+local function isInsideCharacter(obj)
+    local p = obj.Parent
+    local depth = 0
+    while p and depth < 10 do
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character == p then return true end
+            if p == plr.Character then return true end
+        end
+        if p:IsA("BillboardGui") then
+            local host = p.Parent
+            if host and host:IsA("BasePart") then
+                for _, plr in ipairs(Players:GetPlayers()) do
+                    if plr.Character and plr.Character:IsAncestorOf(host) then
+                        return true
+                    end
+                end
+            end
+        end
+        p = p.Parent
+        depth = depth + 1
+    end
+    return false
+end
+
+local function identifyCombatLabel(obj, realName, newName)
+    if not (obj:IsA("TextLabel") or obj:IsA("TextButton")) then return false end
+    if isLeaderboardLabel(obj) then return false end
+    if not isInsideCharacter(obj) then return false end
+
+    local isRed = false
+    pcall(function()
+        local c = obj.TextColor3
+        isRed = c.R > 0.5 and c.G < 0.45 and c.B < 0.45
+    end)
+    if not isRed then return false end
+
+    local t = obj.Text
+    if t == "!" then return true end
+    if #t >= 1 and #t < #realName and realName:sub(1, #t) == t then return true end
+    if newName and #t >= 1 and #t < #newName and newName:sub(1, #t) == t then return true end
+    if t == realName then return true end
+
+    return false
+end
+
+-- ============================================================
+-- FIND OVERHEAD NAME LABEL
+-- ============================================================
+local function findNameLabel(character)
+    local head = character:FindFirstChild("Head")
+    if not head then return nil end
+    for _, obj in ipairs(head:GetChildren()) do
+        if obj:IsA("BillboardGui") then
+            for _, child in ipairs(obj:GetDescendants()) do
+                if child:IsA("TextLabel") then return child end
+            end
+        end
+    end
+    for _, obj in ipairs(character:GetDescendants()) do
+        if obj:IsA("BillboardGui") then
+            for _, child in ipairs(obj:GetDescendants()) do
+                if child:IsA("TextLabel") then return child end
+            end
+        end
+    end
+    return nil
+end
+
+-- ============================================================
+-- LEADERBOARD LABELS
+-- ============================================================
+local function findAllLeaderboardLabels(targetPlayer, searchName)
+    local found = {}
+    local name = searchName or targetPlayer.Name
+    local function scan(parent, depth)
+        if depth > 12 then return end
+        for _, obj in ipairs(parent:GetChildren()) do
+            if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Text == name then
+                registerLeaderboardLabel(obj)
+                table.insert(found, obj)
+            end
+            scan(obj, depth + 1)
+        end
+    end
+    pcall(scan, game:GetService("CoreGui"), 0)
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if pg then scan(pg, 0) end
+    end)
+    return found
+end
+
+-- ============================================================
+-- CONNECTIONS
+-- ============================================================
+local function clearConnections(playerName)
+    if activeConnections[playerName] then
+        for _, conn in ipairs(activeConnections[playerName]) do
+            pcall(function() conn:Disconnect() end)
+        end
+    end
+    activeConnections[playerName] = {}
+end
+
+local function addConn(playerName, conn)
+    if not activeConnections[playerName] then
+        activeConnections[playerName] = {}
+    end
+    table.insert(activeConnections[playerName], conn)
+end
+
+-- ============================================================
+-- HOOK A SINGLE LABEL
+-- ============================================================
+local function hookLabel(obj, realName, nameRef, playerName)
+    if not (obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox")) then return end
+
+    if isLeaderboardLabel(obj) then
+        if obj.Text == realName then obj.Text = nameRef.value end
+        local conn = obj:GetPropertyChangedSignal("Text"):Connect(function()
+            if nameRef.value ~= "" and obj.Text == realName then
+                obj.Text = nameRef.value
+            end
+        end)
+        addConn(playerName, conn)
+        return
+    end
+
+    if combatLabels[obj] then return end
+
+    if obj.Text == realName then obj.Text = nameRef.value end
+
+    local conn = obj:GetPropertyChangedSignal("Text"):Connect(function()
+        if not nameRef.value or nameRef.value == "" then return end
+        if combatLabels[obj] then
+            if obj.Text ~= "!" then obj.Text = "!" end
+            return
+        end
+        if identifyCombatLabel(obj, realName, nameRef.value) then
+            lockCombatLabel(obj)
+            return
+        end
+        if obj.Text == realName then
+            obj.Text = nameRef.value
+        end
+    end)
+    addConn(playerName, conn)
+end
+
+-- ============================================================
+-- SCAN TREE
+-- ============================================================
+local function scanAndHook(parent, realName, nameRef, playerName, depth)
+    depth = depth or 0
+    if depth > 15 then return end
+    for _, obj in ipairs(parent:GetChildren()) do
+        hookLabel(obj, realName, nameRef, playerName)
+        scanAndHook(obj, realName, nameRef, playerName, depth + 1)
+    end
+end
+
+-- ============================================================
+-- ATTACH HOOKS
+-- RenderStepped only scans character - not full GUI tree
+-- ============================================================
+local function attachHooks(targetPlayer, nameRef)
+    local realName = targetPlayer.Name
+    local playerName = targetPlayer.Name
+
+    clearConnections(playerName)
+
+    local function onDescendantAdded(obj)
+        if not nameRef.value or nameRef.value == "" then return end
+        hookLabel(obj, realName, nameRef, playerName)
+    end
+
+    pcall(function()
+        local cg = game:GetService("CoreGui")
+        scanAndHook(cg, realName, nameRef, playerName)
+        addConn(playerName, cg.DescendantAdded:Connect(onDescendantAdded))
+    end)
+
+    pcall(function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if pg then
+            scanAndHook(pg, realName, nameRef, playerName)
+            addConn(playerName, pg.DescendantAdded:Connect(onDescendantAdded))
+        end
+    end)
+
+    pcall(function()
+        local char = targetPlayer.Character
+        if char then
+            scanAndHook(char, realName, nameRef, playerName)
+            addConn(playerName, char.DescendantAdded:Connect(onDescendantAdded))
+        end
+        addConn(playerName, targetPlayer.CharacterAdded:Connect(function(newChar)
+            if nameRef.value and nameRef.value ~= "" then
+                task.defer(function()
+                    scanAndHook(newChar, realName, nameRef, playerName)
+                    addConn(playerName, newChar.DescendantAdded:Connect(onDescendantAdded))
+                end)
+            end
+        end))
+    end)
+
+    -- RenderStepped ONLY sweeps character descendants - zero lag
+    addConn(playerName, RunService.RenderStepped:Connect(function()
+        if not nameRef.value or nameRef.value == "" then return end
+        local char = targetPlayer.Character
+        if not char then return end
+
+        pcall(function()
+            for _, obj in ipairs(char:GetDescendants()) do
+                if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+                    if combatLabels[obj] then
+                        if obj.Text ~= "!" then obj.Text = "!" end
+                    elseif identifyCombatLabel(obj, realName, nameRef.value) then
+                        lockCombatLabel(obj)
+                    elseif obj.Text == realName then
+                        obj.Text = nameRef.value
+                    end
+                end
+            end
+        end)
+    end))
+end
+
+-- ============================================================
+-- LEADERBOARD WATCHER
+-- ============================================================
+local leaderboardWatchers = {}
+
+local function startLeaderboardWatch(targetPlayer, nameRef)
+    if leaderboardWatchers[targetPlayer.Name] then
+        leaderboardWatchers[targetPlayer.Name] = false
+        task.wait(0.06)
+    end
+    leaderboardWatchers[targetPlayer.Name] = true
+    task.spawn(function()
+        while leaderboardWatchers[targetPlayer.Name] do
+            task.wait(0.05)
+            if not nameRef.value or nameRef.value == "" then break end
+            pcall(function()
+                local labels = findAllLeaderboardLabels(targetPlayer, targetPlayer.Name)
+                for _, lbl in ipairs(labels) do
+                    if lbl and lbl.Parent then
+                        if not originalLeaderboard[targetPlayer.Name] then
+                            originalLeaderboard[targetPlayer.Name] = lbl.Text
+                        end
+                        registerLeaderboardLabel(lbl)
+                        lbl.Text = nameRef.value
+                    end
+                end
+                local swappedLabels = findAllLeaderboardLabels(targetPlayer, nameRef.value)
+                for _, lbl in ipairs(swappedLabels) do
+                    if lbl and lbl.Parent then
+                        registerLeaderboardLabel(lbl)
+                    end
+                end
+            end)
+        end
+    end)
+end
+
+local function stopLeaderboardWatch(targetPlayer)
+    leaderboardWatchers[targetPlayer.Name] = false
+end
+
+local function resetLeaderboard(targetPlayer)
+    stopLeaderboardWatch(targetPlayer)
+    task.wait(0.1)
+    pcall(function()
+        local original = originalLeaderboard[targetPlayer.Name] or targetPlayer.Name
+        local swappedName = swapped[targetPlayer.Name]
+        if swappedName then
+            local labels = findAllLeaderboardLabels(targetPlayer, swappedName)
+            for _, lbl in ipairs(labels) do
+                if lbl and lbl.Parent then
+                    leaderboardLabels[lbl] = nil
+                    lbl.Text = original
+                end
+            end
+        end
+    end)
+    originalLeaderboard[targetPlayer.Name] = nil
+end
+
+-- ============================================================
+-- OVERHEAD WATCHER
+-- ============================================================
+local overheadWatchers = {}
+
+local function startOverheadWatch(targetPlayer, nameRef)
+    if overheadWatchers[targetPlayer.Name] then
+        overheadWatchers[targetPlayer.Name] = false
+        task.wait(0.06)
+    end
+    overheadWatchers[targetPlayer.Name] = true
+    task.spawn(function()
+        while overheadWatchers[targetPlayer.Name] do
+            task.wait(0.05)
+            if not nameRef.value or nameRef.value == "" then break end
+            local char = targetPlayer.Character
+            if char then
+                local label = findNameLabel(char)
+                if label and label.Text ~= nameRef.value then
+                    if not originalNames[targetPlayer.Name] then
+                        originalNames[targetPlayer.Name] = label.Text
+                    end
+                    label.Text = nameRef.value
+                end
+            end
+        end
+    end)
+end
+
+local function stopOverheadWatch(targetPlayer)
+    overheadWatchers[targetPlayer.Name] = false
+end
+
+-- ============================================================
+-- SWAP + RESET
+-- ============================================================
+local function swapName(targetPlayer, newName, nameRef)
+    local char = targetPlayer.Character
+    if char then
+        local label = findNameLabel(char)
+        if label then
+            if not originalNames[targetPlayer.Name] then
+                originalNames[targetPlayer.Name] = label.Text
+            end
+            label.Text = newName
+        end
+    end
+    swapped[targetPlayer.Name] = newName
+    startOverheadWatch(targetPlayer, nameRef)
+    startLeaderboardWatch(targetPlayer, nameRef)
+    attachHooks(targetPlayer, nameRef)
+end
+
+local function resetName(targetPlayer)
+    stopOverheadWatch(targetPlayer)
+    clearConnections(targetPlayer.Name)
+
+    for obj in pairs(combatLabels) do
+        pcall(function()
+            if obj and obj.Parent then unlockCombatLabel(obj) end
+        end)
+    end
+
+    local char = targetPlayer.Character
+    if char then
+        local label = findNameLabel(char)
+        if label and originalNames[targetPlayer.Name] then
+            label.Text = originalNames[targetPlayer.Name]
+        end
+    end
+    originalNames[targetPlayer.Name] = nil
+    swapped[targetPlayer.Name] = nil
+    resetLeaderboard(targetPlayer)
+
+    if otherNameRefs[targetPlayer.Name] then
+        otherNameRefs[targetPlayer.Name].value = ""
+    end
+end
+
+-- ============================================================
+-- GUI
+-- ============================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "RPNameSwapper"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0, 28, 0, 28)
+toggleBtn.Position = UDim2.new(0, 12, 0.5, -14)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+toggleBtn.Text = "N"
+toggleBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+toggleBtn.TextSize = 12
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Active = true
+toggleBtn.Draggable = true
+toggleBtn.ZIndex = 10
+toggleBtn.Parent = screenGui
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 6)
+local tStroke = Instance.new("UIStroke")
+tStroke.Color = Color3.fromRGB(60, 60, 60)
+tStroke.Thickness = 1
+tStroke.Parent = toggleBtn
+
+local guiOpen = false
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 270, 0, 360)
+mainFrame.Position = UDim2.new(0, 50, 0.5, -180)
+mainFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Visible = false
+mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+local mStroke = Instance.new("UIStroke")
+mStroke.Color = Color3.fromRGB(45, 45, 45)
+mStroke.Thickness = 1
+mStroke.Parent = mainFrame
+
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 34)
+topBar.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
+topBar.BorderSizePixel = 0
+topBar.Parent = mainFrame
+Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 8)
+
+local topFix = Instance.new("Frame")
+topFix.Size = UDim2.new(1, 0, 0.5, 0)
+topFix.Position = UDim2.new(0, 0, 0.5, 0)
+topFix.BackgroundColor3 = Color3.fromRGB(16, 16, 16)
+topFix.BorderSizePixel = 0
+topFix.Parent = topBar
+
+local topStroke = Instance.new("UIStroke")
+topStroke.Color = Color3.fromRGB(40, 40, 40)
+topStroke.Thickness = 1
+topStroke.Parent = topBar
+
+local topLabel = Instance.new("TextLabel")
+topLabel.Size = UDim2.new(1, -40, 1, 0)
+topLabel.Position = UDim2.new(0, 10, 0, 0)
+topLabel.BackgroundTransparency = 1
+topLabel.Text = "Name Swapper"
+topLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+topLabel.TextSize = 13
+topLabel.Font = Enum.Font.Gotham
+topLabel.TextXAlignment = Enum.TextXAlignment.Left
+topLabel.Parent = topBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 24, 0, 24)
+closeBtn.Position = UDim2.new(1, -28, 0, 5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(140, 140, 140)
+closeBtn.TextSize = 11
+closeBtn.Font = Enum.Font.Gotham
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = topBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, 0, 1, -38)
+scroll.Position = UDim2.new(0, 0, 0, 38)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 60)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+scroll.Parent = mainFrame
+
+local scrollLayout = Instance.new("UIListLayout")
+scrollLayout.Padding = UDim.new(0, 6)
+scrollLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+scrollLayout.Parent = scroll
+
+local scrollPad = Instance.new("UIPadding")
+scrollPad.PaddingTop = UDim.new(0, 8)
+scrollPad.PaddingLeft = UDim.new(0, 10)
+scrollPad.PaddingRight = UDim.new(0, 14)
+scrollPad.PaddingBottom = UDim.new(0, 10)
+scrollPad.Parent = scroll
+
+scrollLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    scroll.CanvasSize = UDim2.new(0, 0, 0, scrollLayout.AbsoluteContentSize.Y + 18)
+end)
+
+local function divider()
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, 0, 0, 1)
+    f.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+    f.BorderSizePixel = 0
+    f.Parent = scroll
+end
+
+local function sectionLbl(txt)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, 0, 0, 16)
+    l.BackgroundTransparency = 1
+    l.Text = txt
+    l.TextColor3 = Color3.fromRGB(90, 90, 90)
+    l.TextSize = 10
+    l.Font = Enum.Font.Gotham
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = scroll
+end
+
+local function makeBox(placeholder)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, 0, 0, 32)
+    box.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+    box.BorderSizePixel = 0
+    box.Text = ""
+    box.PlaceholderText = placeholder
+    box.PlaceholderColor3 = Color3.fromRGB(70, 70, 70)
+    box.TextColor3 = Color3.fromRGB(200, 200, 200)
+    box.TextSize = 13
+    box.Font = Enum.Font.Fantasy
+    box.ClearTextOnFocus = false
+    box.TextStrokeTransparency = 0.6
+    box.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    box.Parent = scroll
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    local s = Instance.new("UIStroke", box)
+    s.Color = Color3.fromRGB(40, 40, 40)
+    s.Thickness = 1
+    return box
+end
+
+local function makeBtn(txt)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 30)
+    btn.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+    btn.BorderSizePixel = 0
+    btn.Text = txt
+    btn.TextColor3 = Color3.fromRGB(190, 190, 190)
+    btn.TextSize = 12
+    btn.Font = Enum.Font.Gotham
+    btn.Parent = scroll
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    local s = Instance.new("UIStroke", btn)
+    s.Color = Color3.fromRGB(45, 45, 45)
+    s.Thickness = 1
+    return btn
+end
+
+sectionLbl("SELECT PLAYER")
+divider()
+
+local refreshBtn = makeBtn("Refresh List")
+
+local listOuter = Instance.new("Frame")
+listOuter.Size = UDim2.new(1, 0, 0, 120)
+listOuter.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
+listOuter.BorderSizePixel = 0
+listOuter.Parent = scroll
+Instance.new("UICorner", listOuter).CornerRadius = UDim.new(0, 6)
+local lo = Instance.new("UIStroke", listOuter)
+lo.Color = Color3.fromRGB(35, 35, 35)
+lo.Thickness = 1
+
+local listScroll = Instance.new("ScrollingFrame")
+listScroll.Size = UDim2.new(1, -4, 1, -4)
+listScroll.Position = UDim2.new(0, 2, 0, 2)
+listScroll.BackgroundTransparency = 1
+listScroll.BorderSizePixel = 0
+listScroll.ScrollBarThickness = 3
+listScroll.ScrollBarImageColor3 = Color3.fromRGB(55, 55, 55)
+listScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+listScroll.Parent = listOuter
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 2)
+listLayout.Parent = listScroll
+
+listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    listScroll.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 4)
+end)
+
+divider()
+sectionLbl("NEW NAME")
+
+local nameBox = makeBox("Type roleplay name...")
+local applyBtn = makeBtn("Set Name")
+local resetBtn = makeBtn("Restore Original")
+
+local selectedTarget = nil
+local playerBtns = {}
+
+local function refreshList()
+    for _, b in pairs(playerBtns) do
+        pcall(function() b:Destroy() end)
+    end
+    playerBtns = {}
+    selectedTarget = nil
+    nameBox.PlaceholderText = "Type roleplay name..."
+
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= player then
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -4, 0, 26)
+            btn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+            btn.BorderSizePixel = 0
+            btn.Text = "  " .. p.Name .. (swapped[p.Name] and "  ✓" or "")
+            btn.TextColor3 = Color3.fromRGB(170, 170, 170)
+            btn.TextSize = 12
+            btn.Font = Enum.Font.Gotham
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.Parent = listScroll
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+            playerBtns[p.Name] = btn
+
+            btn.MouseButton1Click:Connect(function()
+                for _, b in pairs(playerBtns) do
+                    b.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+                    b.TextColor3 = Color3.fromRGB(170, 170, 170)
+                end
+                btn.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
+                btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+                selectedTarget = p
+                nameBox.PlaceholderText = p.Name .. " → new name..."
+                nameBox.Text = swapped[p.Name] or ""
+            end)
+        end
+    end
+end
+
+refreshBtn.MouseButton1Click:Connect(function()
+    refreshList()
+    refreshBtn.Text = "✓  Refreshed"
+    task.delay(1.5, function() refreshBtn.Text = "Refresh List" end)
+end)
+
+applyBtn.MouseButton1Click:Connect(function()
+    if not selectedTarget then
+        applyBtn.Text = "Select a player first"
+        task.delay(2, function() applyBtn.Text = "Set Name" end)
+        return
+    end
+    if nameBox.Text == "" then
+        applyBtn.Text = "Type a name first"
+        task.delay(2, function() applyBtn.Text = "Set Name" end)
+        return
+    end
+    if not otherNameRefs[selectedTarget.Name] then
+        otherNameRefs[selectedTarget.Name] = { value = "" }
+    end
+    otherNameRefs[selectedTarget.Name].value = nameBox.Text
+    swapName(selectedTarget, nameBox.Text, otherNameRefs[selectedTarget.Name])
+    if playerBtns[selectedTarget.Name] then
+        playerBtns[selectedTarget.Name].Text = "  " .. selectedTarget.Name .. "  ✓"
+    end
+    applyBtn.Text = "✓  Applied"
+    task.delay(2, function() applyBtn.Text = "Set Name" end)
+end)
+
+resetBtn.MouseButton1Click:Connect(function()
+    if not selectedTarget then
+        resetBtn.Text = "Select a player first"
+        task.delay(2, function() resetBtn.Text = "Restore Original" end)
+        return
+    end
+    resetName(selectedTarget)
+    nameBox.Text = ""
+    if playerBtns[selectedTarget.Name] then
+        playerBtns[selectedTarget.Name].Text = "  " .. selectedTarget.Name
+    end
+    resetBtn.Text = "✓  Restored"
+    task.delay(2, function() resetBtn.Text = "Restore Original" end)
+end)
+
+toggleBtn.MouseButton1Click:Connect(function()
+    guiOpen = not guiOpen
+    mainFrame.Visible = guiOpen
+    toggleBtn.TextColor3 = guiOpen and Color3.fromRGB(255,255,255) or Color3.fromRGB(200,200,200)
+    toggleBtn.BackgroundColor3 = guiOpen and Color3.fromRGB(30,30,30) or Color3.fromRGB(20,20,20)
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    guiOpen = false
+    mainFrame.Visible = false
+    toggleBtn.TextColor3 = Color3.fromRGB(200,200,200)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(20,20,20)
+end)
+
+Players.PlayerAdded:Connect(function()
+    task.wait(0.5)
+    refreshList()
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+    stopLeaderboardWatch(p)
+    stopOverheadWatch(p)
+    clearConnections(p.Name)
+    task.wait(0.5)
+    refreshList()
+end)
+
+refreshList()
+print("✅ Name Swapper loaded — tap N to open")
